@@ -1,0 +1,68 @@
+name: Preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ['**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: parse
+        uses: harelab-ucsc/px4-preflight-runner/actions/parse-spec@main
+        with:
+          spec-path: .preflight/spec.yaml
+
+  run-case:
+    needs: generate-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    container:
+      image: ${{ matrix.container_image }}
+      options: --privileged --user root --ulimit core=-1 --security-opt seccomp=unconfined
+    steps:
+      - uses: actions/checkout@v4
+      - uses: harelab-ucsc/px4-preflight-runner/actions/run-case@main
+        with:
+          case-json: ${{ toJson(matrix) }}
+
+  post-comment:
+    needs: run-case
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '## Preflight Results',
+              '',
+              `Simulation artifacts: [View run](${runUrl})`,
+              '',
+              '**Replay in Hawkeye:**',
+              '1. Download the `preflight-offboard-waypoint-mission-*` artifact.',
+              '2. Extract the `.ulg` file.',
+              '3. Run: `hawkeye --replay flight.ulg`',
+              '',
+              '_Install: `brew install PX4/px4/hawkeye` or [grab the .deb](https://github.com/PX4/Hawkeye/releases/latest)._',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

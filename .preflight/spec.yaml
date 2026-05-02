@@ -1,0 +1,75 @@
+version: 1
+
+defaults:
+  ros_distro: humble
+  px4_ref: v1.16.0
+  hawkeye_ref: latest
+  timeout_sec: 90
+  container_image: ghcr.io/harelab-ucsc/px4-preflight-runner:humble
+
+ros_workspace_extra:
+  px4_ros2_interface_lib:
+    type: git
+    url: https://github.com/Auterion/px4-ros2-interface-lib.git
+    version: main
+
+airframes:
+  iris_base:
+    vehicle: iris
+    px4_model: sihsim_quadx
+    params:
+      MIS_TAKEOFF_ALT: 5.0
+      COM_RC_IN_MODE: 1
+      NAV_DLL_ACT: 0
+
+  preflight_tuned:
+    extends: iris_base
+    params:
+      MPC_XY_VEL_MAX: 3.0
+      MPC_Z_VEL_MAX_UP: 1.5
+
+environments:
+  ros_unit:
+    container_image: ghcr.io/harelab-ucsc/px4-preflight-runner:humble
+    env:
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+
+  sih_default:
+    container_image: ghcr.io/harelab-ucsc/px4-preflight-runner:humble
+    env:
+      PREFLIGHT_MODE: normal
+
+  sih_strict:
+    container_image: ghcr.io/harelab-ucsc/px4-preflight-runner:humble
+    env:
+      PREFLIGHT_MODE: strict
+
+tests:
+  - name: ros-unit-tests
+    type: ros_unit
+    environment: ros_unit
+    packages: [px4_preflight_demo]
+
+  - name: px4-build
+    type: px4_build
+    environment: sih_default
+
+  - name: sim-basic
+    type: sim
+    environment: sih_default
+    airframe: iris_base
+    packages: [px4_preflight_demo]
+    launch: launch/sim.launch.py
+    duration_sec: 60
+    hawkeye_replay: true
+
+  - name: offboard-waypoint-mission
+    type: sim
+    environment: sih_strict
+    airframe: preflight_tuned
+    packages: [px4_preflight_demo]
+    launch: launch/offboard_mission.launch.py
+    duration_sec: 120
+    assertions: .preflight/tests/waypoint_check.py
+    hawkeye_replay: true
+    offboard: true
