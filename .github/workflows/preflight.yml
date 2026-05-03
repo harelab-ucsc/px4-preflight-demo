@@ -24,6 +24,7 @@ jobs:
 
   run-case:
     needs: generate-matrix
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
