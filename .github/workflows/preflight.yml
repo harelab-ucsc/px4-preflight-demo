@@ -2,7 +2,7 @@ name: Preflight
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: ['**']
 
@@ -18,12 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: parse
-        uses: harelab-ucsc/px4-preflight-runner/actions/parse-spec@main
+        uses: harelab-ucsc/px4-preflight-runner/actions/parse-spec@feature/better-action-names
         with:
           spec-path: .preflight/spec.yaml
 
   run-case:
     needs: generate-matrix
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
@@ -33,7 +34,7 @@ jobs:
       options: --privileged --user root --ulimit core=-1 --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      - uses: harelab-ucsc/px4-preflight-runner/actions/run-case@main
+      - uses: harelab-ucsc/px4-preflight-runner/actions/run-case@feature/better-action-names
         with:
           case-json: ${{ toJson(matrix) }}
 
