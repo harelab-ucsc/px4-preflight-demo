@@ -1,0 +1,102 @@
+<!doctype html>
+<!--
+  Hawkeye WASM auto-load harness.
+
+  Drop this file alongside hawkeye.js / hawkeye.wasm / [hawkeye.data] /
+  flight.ulg and serve the directory over HTTP. The page boots Hawkeye,
+  fetches `flight.ulg`, hands it to hawkeye_load_ulog_bytes, and starts
+  playback.
+
+  Differs from upstream wasm/shell.html in two ways:
+    1. Auto-loads a fixed-path ULog instead of waiting for a file input.
+    2. Strips the dev panels (no log textarea, no UI debug panel).
+
+  See https://github.com/PX4/Hawkeye/blob/main/wasm/wasm_api.h for the
+  embed API.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Preflight replay</title>
+<style>
+    html, body { margin: 0; height: 100%; background: #0a0c10; color: #e0e4ec;
+                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    #status { position: fixed; left: 12px; top: 8px; font-size: 12px;
+              color: #8a93a5; pointer-events: none; }
+    #canvas { display: block; width: 100%; height: 100vh; background: #000;
+              outline: none; }
+    a { color: #7da7ff; }
+</style>
+</head>
+<body>
+<div id="status">loading…</div>
+<canvas id="canvas" tabindex="0"></canvas>
+
+<script>
+const status = document.getElementById('status');
+const canvas = document.getElementById('canvas');
+
+function setStatus(s) {
+    status.textContent = s;
+    console.log('[replay]', s);
+}
+
+// Block space-bar page scroll while the canvas is focused so play/pause
+// works without scrolling the page (matches upstream shell.html).
+canvas.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') e.preventDefault();
+});
+
+window.Module = {
+    canvas,
+    print: (text) => console.log(text),
+    printErr: (text) => console.warn(text),
+    onRuntimeInitialized: async () => {
+        const w = canvas.clientWidth | 0;
+        const h = canvas.clientHeight | 0;
+        canvas.width = w; canvas.height = h;
+        const init = Module.cwrap('hawkeye_init', 'number',
+            ['string', 'number', 'number']);
+        const rc = init('#canvas', w, h);
+        if (rc !== 0) { setStatus(`hawkeye_init failed: ${rc}`); return; }
+
+        setStatus('fetching flight.ulg…');
+        let buf;
+        try {
+            const resp = await fetch('flight.ulg');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            buf = new Uint8Array(await resp.arrayBuffer());
+        } catch (e) {
+            setStatus(`fetch failed: ${e.message}`);
+            return;
+        }
+
+        const ptr = Module._malloc(buf.byteLength);
+        Module.HEAPU8.set(buf, ptr);
+        const load = Module.cwrap('hawkeye_load_ulog_bytes', 'number',
+            ['number', 'number']);
+        const lrc = load(ptr, buf.byteLength);
+        Module._free(ptr);
+        if (lrc !== 0) { setStatus(`load_ulog failed: ${lrc}`); return; }
+
+        Module.cwrap('hawkeye_set_playing', null, ['number'])(1);
+        const dur = Module.cwrap('hawkeye_get_duration', 'number', [])();
+        setStatus(`playing — ${dur.toFixed(1)}s flight`);
+        canvas.focus();
+    },
+};
+
+// Resize on viewport change.
+window.addEventListener('resize', () => {
+    const w = canvas.clientWidth | 0;
+    const h = canvas.clientHeight | 0;
+    canvas.width = w; canvas.height = h;
+    if (Module && Module.cwrap) {
+        Module.cwrap('hawkeye_resize', null, ['number', 'number'])(w, h);
+    }
+});
+</script>
+<script src="hawkeye.js"></script>
+</body>
+</html>
