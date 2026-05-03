@@ -11,7 +11,7 @@ ros_workspace_extra:
   px4_ros2_interface_lib:
     type: git
     url: https://github.com/Auterion/px4-ros2-interface-lib.git
-    version: main
+    version: release/1.16
 
 airframes:
   iris_base:
