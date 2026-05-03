@@ -2,7 +2,7 @@ name: Preflight
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: ['**']
 
@@ -27,6 +27,7 @@ jobs:
 
   run-case:
     needs: generate-matrix
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
