@@ -42,6 +42,8 @@ NAV_STATE_OFFBOARD = 14
 VEHICLE_CMD_DO_SET_MODE = 176
 VEHICLE_CMD_COMPONENT_ARM_DISARM = 400
 PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
+PX4_CUSTOM_MAIN_MODE_AUTO = 3
+PX4_CUSTOM_SUB_MODE_AUTO_LAND = 6
 
 
 class OffboardMissionNode(Node):
@@ -81,7 +83,6 @@ class OffboardMissionNode(Node):
         self._state = "init"
         self._stable_ticks = 0
         self._done = False
-        self._final_wp = None
         self.results = {
             "waypoints_hit": [False] * len(WAYPOINTS),
             "hit_count": 0,
@@ -121,11 +122,12 @@ class OffboardMissionNode(Node):
         msg.timestamp = self._now_us()
         self.setpoint_pub.publish(msg)
 
-    def _send_command(self, command, param1=0.0, param2=0.0):
+    def _send_command(self, command, param1=0.0, param2=0.0, param3=0.0):
         msg = VehicleCommand()
         msg.command = command
         msg.param1 = float(param1)
         msg.param2 = float(param2)
+        msg.param3 = float(param3)
         msg.target_system = 1
         msg.target_component = 1
         msg.source_system = 1
@@ -139,11 +141,15 @@ class OffboardMissionNode(Node):
         # Setpoints must stream on every tick — PX4 drops OFFBOARD if they stop.
         self._publish_offboard_mode()
 
-        # After mission complete, hold last position so OFFBOARD stays engaged
-        # until run_sim.sh's timeout kills the process.
+        # After mission complete, command AUTO.LAND so the vehicle lands
+        # gracefully rather than hanging in OFFBOARD until the process is killed.
         if self._done:
-            if self._final_wp is not None:
-                self._publish_setpoint(*self._final_wp)
+            self._send_command(
+                VEHICLE_CMD_DO_SET_MODE,
+                1.0,
+                PX4_CUSTOM_MAIN_MODE_AUTO,
+                PX4_CUSTOM_SUB_MODE_AUTO_LAND,
+            )
             return
 
         wp = WAYPOINTS[min(self.current_wp, len(WAYPOINTS) - 1)]
@@ -191,7 +197,6 @@ class OffboardMissionNode(Node):
 
         elif self._state == "flying":
             if self.current_wp >= len(WAYPOINTS):
-                self._final_wp = WAYPOINTS[-1]
                 self._finish(passed=True, reason="all waypoints reached")
                 return
             if self.position is not None:
