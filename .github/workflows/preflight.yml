@@ -18,10 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: parse
-        # NOTE: while feature/hawkeye-wasm-replay is open, this is pinned to
-        # the matching feature branch in the runner repo. Switch back to
-        # @main once both branches merge.
-        uses: harelab-ucsc/px4-preflight-runner/actions/parse-spec@feature/hawkeye-wasm-replay
+        uses: harelab-ucsc/px4-preflight-runner/actions/parse-spec@main
         with:
           spec-path: .preflight/spec.yaml
 
@@ -37,7 +34,7 @@ jobs:
       options: --privileged --user root --ulimit core=-1 --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
-      - uses: harelab-ucsc/px4-preflight-runner/actions/run-case@feature/hawkeye-wasm-replay
+      - uses: harelab-ucsc/px4-preflight-runner/actions/run-case@main
         with:
           case-json: ${{ toJson(matrix) }}
 
@@ -80,7 +77,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: harelab-ucsc/px4-preflight-runner
-          ref: feature/hawkeye-wasm-replay
+          ref: main
           path: .runner
 
       - name: Download case artifact (contains the ULog)
