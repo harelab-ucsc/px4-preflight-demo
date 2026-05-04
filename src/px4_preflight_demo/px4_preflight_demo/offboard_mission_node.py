@@ -42,38 +42,44 @@ NAV_STATE_OFFBOARD = 14
 VEHICLE_CMD_DO_SET_MODE = 176
 VEHICLE_CMD_COMPONENT_ARM_DISARM = 400
 PX4_CUSTOM_MAIN_MODE_OFFBOARD = 6
-PX4_CUSTOM_MAIN_MODE_AUTO = 4
-PX4_CUSTOM_SUB_MODE_AUTO_LAND = 6
 
 
 class OffboardMissionNode(Node):
     def __init__(self):
         super().__init__("offboard_mission")
 
-        qos = QoSProfile(
+        # Publishers use TRANSIENT_LOCAL; subscribers use VOLATILE.
+        # Mixing them causes silent QoS mismatches (ref: Jaeyoung-Lim/px4-offboard).
+        pub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
         self.offboard_pub = self.create_publisher(
-            OffboardControlMode, "/fmu/in/offboard_control_mode", qos
+            OffboardControlMode, "/fmu/in/offboard_control_mode", pub_qos
         )
         self.setpoint_pub = self.create_publisher(
-            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", qos
+            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", pub_qos
         )
         self.cmd_pub = self.create_publisher(
-            VehicleCommand, "/fmu/in/vehicle_command", qos
+            VehicleCommand, "/fmu/in/vehicle_command", pub_qos
         )
-        self.create_subscription(
-            VehicleStatus, "/fmu/out/vehicle_status_v1", self._on_status, qos
-        )
+        # Subscribe to both names: v1.16+ renamed to vehicle_status_v1.
+        for topic in ("/fmu/out/vehicle_status", "/fmu/out/vehicle_status_v1"):
+            self.create_subscription(VehicleStatus, topic, self._on_status, sub_qos)
         self.create_subscription(
             VehicleLocalPosition,
             "/fmu/out/vehicle_local_position",
             self._on_position,
-            qos,
+            sub_qos,
         )
 
         self.armed = False
@@ -122,12 +128,11 @@ class OffboardMissionNode(Node):
         msg.timestamp = self._now_us()
         self.setpoint_pub.publish(msg)
 
-    def _send_command(self, command, param1=0.0, param2=0.0, param3=0.0):
+    def _send_command(self, command, param1=0.0, param2=0.0):
         msg = VehicleCommand()
         msg.command = command
         msg.param1 = float(param1)
         msg.param2 = float(param2)
-        msg.param3 = float(param3)
         msg.target_system = 1
         msg.target_component = 1
         msg.source_system = 1
@@ -138,22 +143,16 @@ class OffboardMissionNode(Node):
 
     # ── Main loop ────────────────────────────────────────────────────────
     def _control_loop(self):
+        if self._done:
+            # Stay in OFFBOARD and stream a ground-level setpoint (NED z=0).
+            # PX4's position controller descends, land detection fires, and
+            # the vehicle disarms on its own — no mode switching needed.
+            self._publish_offboard_mode()
+            self._publish_setpoint(0.0, 0.0, 0.0)
+            return
+
         # Setpoints must stream on every tick — PX4 drops OFFBOARD if they stop.
         self._publish_offboard_mode()
-
-        # After mission complete, hold the last setpoint to keep OFFBOARD alive
-        # while the AUTO.LAND mode switch takes effect. Without a fresh
-        # trajectory_setpoint, OFFBOARD times out in ~500ms and the
-        # OFFBOARD-loss failsafe (COM_OBL_ACT=0, position hold) wins the race.
-        if self._done:
-            self._publish_setpoint(*WAYPOINTS[-1])
-            self._send_command(
-                VEHICLE_CMD_DO_SET_MODE,
-                1.0,
-                PX4_CUSTOM_MAIN_MODE_AUTO,
-                PX4_CUSTOM_SUB_MODE_AUTO_LAND,
-            )
-            return
 
         wp = WAYPOINTS[min(self.current_wp, len(WAYPOINTS) - 1)]
         self._publish_setpoint(*wp)

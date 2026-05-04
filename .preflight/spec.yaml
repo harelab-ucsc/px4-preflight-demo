@@ -27,7 +27,6 @@ airframes:
     params:
       MPC_XY_VEL_MAX: 3.0
       MPC_Z_VEL_MAX_UP: 1.5
-      COM_OBL_ACT: 4
 
 environments:
   ros_unit:
