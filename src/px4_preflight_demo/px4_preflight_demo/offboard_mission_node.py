@@ -78,7 +78,8 @@ class OffboardMissionNode(Node):
         self.offboard = False
         self.position = None
         self.current_wp = 0
-        self.setpoint_count = 0
+        self._state = "init"
+        self._stable_ticks = 0
         self._done = False
         self._final_wp = None
         self.results = {
@@ -135,47 +136,70 @@ class OffboardMissionNode(Node):
 
     # ── Main loop ────────────────────────────────────────────────────────
     def _control_loop(self):
-        # Setpoints must stream continuously for OFFBOARD to stay engaged.
+        # Setpoints must stream on every tick — PX4 drops OFFBOARD if they stop.
         self._publish_offboard_mode()
 
+        # After mission complete, hold last position so OFFBOARD stays engaged
+        # until run_sim.sh's timeout kills the process.
         if self._done:
-            # Keep streaming the final position so OFFBOARD doesn't drop
-            # while run_sim.sh's timeout is still counting down.
             if self._final_wp is not None:
                 self._publish_setpoint(*self._final_wp)
             return
 
-        if self.current_wp >= len(WAYPOINTS):
-            self._final_wp = WAYPOINTS[-1]
-            self._finish(passed=True, reason="all waypoints reached")
-            return
-
-        wp = WAYPOINTS[self.current_wp]
+        wp = WAYPOINTS[min(self.current_wp, len(WAYPOINTS) - 1)]
         self._publish_setpoint(*wp)
-        self.setpoint_count += 1
 
-        # PX4 offboard sequence: switch to OFFBOARD while disarmed (setpoints
-        # must already be streaming), then arm once PX4 confirms OFFBOARD.
-        # Arming first risks PX4 latching into HOLD/LOITER before the mode
-        # switch lands, after which OFFBOARD is rejected.
-        if self.setpoint_count >= 10 and not self.offboard:
+        # State machine matching the official PX4 ROS 2 offboard example:
+        # 1. init           — request OFFBOARD mode on first tick
+        # 2. offboard_req   — wait for VehicleStatus to confirm nav_state==OFFBOARD
+        # 3. stable_offboard— stream 10 more ticks so PX4 considers it stable
+        # 4. arm_req        — send ARM, wait for arming_state==ARMED
+        # 5. flying         — execute waypoints
+        if self._state == "init":
             self._send_command(
                 VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
             )
-        elif self.setpoint_count >= 10 and self.offboard and not self.armed:
-            self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+            self._state = "offboard_req"
 
-        if self.position is not None:
-            dx = self.position[0] - wp[0]
-            dy = self.position[1] - wp[1]
-            dz = self.position[2] - wp[2]
-            if math.sqrt(dx * dx + dy * dy + dz * dz) < WAYPOINT_RADIUS:
-                self.results["waypoints_hit"][self.current_wp] = True
-                self.results["hit_count"] += 1
-                self.get_logger().info(
-                    f"waypoint {self.current_wp + 1}/{len(WAYPOINTS)} reached"
+        elif self._state == "offboard_req":
+            if self.offboard:
+                self.get_logger().info("OFFBOARD mode confirmed")
+                self._state = "stable_offboard"
+            else:
+                # Retry until PX4 accepts the mode switch
+                self._send_command(
+                    VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
                 )
-                self.current_wp += 1
+
+        elif self._state == "stable_offboard":
+            self._stable_ticks += 1
+            if self._stable_ticks >= 10:
+                self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+                self._state = "arm_req"
+
+        elif self._state == "arm_req":
+            if self.armed:
+                self.get_logger().info("Armed in OFFBOARD mode — starting mission")
+                self._state = "flying"
+            else:
+                self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+
+        elif self._state == "flying":
+            if self.current_wp >= len(WAYPOINTS):
+                self._final_wp = WAYPOINTS[-1]
+                self._finish(passed=True, reason="all waypoints reached")
+                return
+            if self.position is not None:
+                dx = self.position[0] - wp[0]
+                dy = self.position[1] - wp[1]
+                dz = self.position[2] - wp[2]
+                if math.sqrt(dx * dx + dy * dy + dz * dz) < WAYPOINT_RADIUS:
+                    self.results["waypoints_hit"][self.current_wp] = True
+                    self.results["hit_count"] += 1
+                    self.get_logger().info(
+                        f"waypoint {self.current_wp + 1}/{len(WAYPOINTS)} reached"
+                    )
+                    self.current_wp += 1
 
     def _finish(self, passed, reason):
         if self._done:
