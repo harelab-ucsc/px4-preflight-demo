@@ -23,7 +23,6 @@ from px4_msgs.msg import (
     OffboardControlMode,
     TrajectorySetpoint,
     VehicleCommand,
-    VehicleLandDetected,
     VehicleLocalPosition,
     VehicleStatus,
 )
@@ -82,21 +81,14 @@ class OffboardMissionNode(Node):
             self._on_position,
             sub_qos,
         )
-        self.create_subscription(
-            VehicleLandDetected,
-            "/fmu/out/vehicle_land_detected",
-            self._on_land_detected,
-            sub_qos,
-        )
-
         self.armed = False
         self.offboard = False
         self.position = None
-        self.landed = False
         self.current_wp = 0
         self._state = "init"
         self._stable_ticks = 0
         self._done = False
+        self.done_future = rclpy.task.Future()
         self.results = {
             "waypoints_hit": [False] * len(WAYPOINTS),
             "hit_count": 0,
@@ -114,9 +106,6 @@ class OffboardMissionNode(Node):
 
     def _on_position(self, msg):
         self.position = (msg.x, msg.y, msg.z)
-
-    def _on_land_detected(self, msg):
-        self.landed = msg.landed
 
     # ── Helpers ──────────────────────────────────────────────────────────
     def _now_us(self):
@@ -155,12 +144,6 @@ class OffboardMissionNode(Node):
     # ── Main loop ────────────────────────────────────────────────────────
     def _control_loop(self):
         if self._done:
-            if self.landed:
-                self.get_logger().info("Landed — shutting down")
-                rclpy.shutdown()
-                return
-            self._publish_offboard_mode()
-            self._publish_setpoint(0.0, 0.0, 0.0)
             return
 
         # Setpoints must stream on every tick — PX4 drops OFFBOARD if they stop.
@@ -234,13 +217,14 @@ class OffboardMissionNode(Node):
         with open(RESULTS_PATH, "w") as f:
             json.dump(self.results, f, indent=2)
         self.get_logger().info(f"results written to {RESULTS_PATH}: {self.results}")
+        self.done_future.set_result(True)
 
 
 def main():
     rclpy.init()
     node = OffboardMissionNode()
     try:
-        rclpy.spin(node)
+        rclpy.spin_until_future_complete(node, node.done_future)
     except KeyboardInterrupt:
         pass
     finally:
