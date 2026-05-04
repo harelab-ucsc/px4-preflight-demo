@@ -38,6 +38,172 @@ jobs:
         with:
           case-json: ${{ toJson(matrix) }}
 
+  # ── Filter the parsed matrix down to just the sim cases. The replay
+  #    pipeline below only runs when at least one sim case exists. ────────
+  discover-sim-cases:
+    needs: generate-matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+      has-sim: ${{ steps.filter.outputs.has-sim }}
+    steps:
+      - id: filter
+        env:
+          FULL_MATRIX: ${{ needs.generate-matrix.outputs.matrix }}
+        run: |
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import json, os
+          m = json.loads(os.environ["FULL_MATRIX"])
+          sim = [c for c in m.get("include", []) if c.get("type") == "sim"]
+          print(f"matrix={json.dumps({'include': sim})}")
+          print(f"has-sim={'true' if sim else 'false'}")
+          PY
+
+  # ── Per-sim-case: build a Hawkeye WASM replay bundle (HTML + .js + .wasm
+  #    + flight.ulg). Each bundle is uploaded as a separate workflow
+  #    artifact for the deploy job to pick up. ──────────────────────────
+  build-replay-bundle:
+    needs: [run-case, discover-sim-cases]
+    # Run even if some sim cases failed — a partial replay is still useful
+    # for triaging the failing case.
+    if: always() && needs.discover-sim-cases.outputs.has-sim == 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-sim-cases.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out runner repo (for the publish-replay action)
+        uses: actions/checkout@v4
+        with:
+          repository: harelab-ucsc/px4-preflight-runner
+          ref: main
+          path: .runner
+
+      - name: Download case artifact (contains the ULog)
+        uses: actions/download-artifact@v4
+        with:
+          name: preflight-${{ matrix.name }}-${{ github.run_id }}
+          path: _case
+
+      - name: Locate ULog
+        id: ulg
+        run: |
+          set -euo pipefail
+          ULG=$(find _case -maxdepth 2 -name '*.ulg' | head -1 || true)
+          if [ -z "${ULG}" ]; then
+            echo "no .ulg in artifact for ${{ matrix.name }}; skipping bundle"
+            exit 0
+          fi
+          echo "path=${ULG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build replay bundle
+        if: steps.ulg.outputs.path != ''
+        uses: ./.runner/actions/publish-replay
+        with:
+          ulog-path: ${{ steps.ulg.outputs.path }}
+          case-name: ${{ matrix.name }}
+          output-dir: ${{ github.workspace }}/_bundle
+
+      - name: Upload bundle as workflow artifact
+        if: steps.ulg.outputs.path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-bundle-${{ matrix.name }}
+          path: _bundle/${{ matrix.name }}/
+          retention-days: 14
+
+  # ── Single deploy job: aggregates all per-case bundles, publishes to a
+  #    per-run subdir under gh-pages, and links them in the PR comment. ──
+  deploy-replay:
+    needs: build-replay-bundle
+    if: always() && needs.build-replay-bundle.result != 'skipped'
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: replay-bundle-*
+          path: _bundles
+
+      - name: Restructure for Pages publish
+        id: stage
+        run: |
+          set -euo pipefail
+          STAGE=_pages_stage
+          mkdir -p "${STAGE}"
+          shopt -s nullglob
+          count=0
+          for d in _bundles/replay-bundle-*; do
+            name=$(basename "$d" | sed 's/^replay-bundle-//')
+            cp -r "$d" "${STAGE}/${name}"
+            count=$((count + 1))
+            echo "staged ${name}"
+          done
+          echo "count=${count}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate top-level index
+        if: steps.stage.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          STAGE=_pages_stage
+          {
+            echo '<!doctype html><meta charset=utf-8>'
+            echo "<title>Preflight replay — run ${{ github.run_id }}</title>"
+            echo '<style>body{font-family:system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem;color:#1a1d24}a{color:#2058ce}</style>'
+            echo "<h1>Preflight replay — run ${{ github.run_id }}</h1>"
+            echo '<ul>'
+            for d in "${STAGE}"/*/; do
+              name=$(basename "${d%/}")
+              echo "<li><a href=\"${name}/\">${name}</a></li>"
+            done
+            echo '</ul>'
+          } > "${STAGE}/index.html"
+
+      - name: Deploy to gh-pages
+        if: steps.stage.outputs.count != '0'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: _pages_stage
+          # Per-run subdir so previous runs are preserved and findable.
+          destination_dir: runs/${{ github.run_id }}
+          # Don't blow away other runs' subdirs on this branch.
+          keep_files: true
+          commit_message: 'replay: run ${{ github.run_id }}'
+
+      - name: Comment replay URLs on PR
+        if: github.event_name == 'pull_request' && steps.stage.outputs.count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const dirs = fs.readdirSync('_pages_stage', {withFileTypes: true})
+              .filter(e => e.isDirectory())
+              .map(e => e.name);
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const base  = `https://${owner}.github.io/${repo}/runs/${context.runId}`;
+            const lines = [
+              '## Replay viewer (Hawkeye WASM, experimental)',
+              '',
+              `Open in browser: ${base}/`,
+              '',
+              'Per-case:',
+              ...dirs.map(d => `- [${d}](${base}/${d}/)`),
+              '',
+              '_Replay built with Hawkeye WASM @ pinned commit. The viewer is single-threaded and requires WebGL2._',
+            ];
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number, owner, repo,
+              body: lines.join('\n'),
+            });
+
   post-comment:
     needs: run-case
     if: github.event_name == 'pull_request'
@@ -54,12 +220,14 @@ jobs:
               '',
               `Simulation artifacts: [View run](${runUrl})`,
               '',
-              '**Replay in Hawkeye:**',
+              '**Replay locally:**',
               '1. Download the `preflight-offboard-waypoint-mission-*` artifact.',
               '2. Extract the `.ulg` file.',
               '3. Run: `hawkeye --replay flight.ulg`',
               '',
               '_Install: `brew install PX4/px4/hawkeye` or [grab the .deb](https://github.com/PX4/Hawkeye/releases/latest)._',
+              '',
+              '_(For a browser replay, see the separate **Replay viewer** comment from the experimental Hawkeye WASM pipeline.)_',
             ].join('\n');
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
