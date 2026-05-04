@@ -141,9 +141,12 @@ class OffboardMissionNode(Node):
         # Setpoints must stream on every tick — PX4 drops OFFBOARD if they stop.
         self._publish_offboard_mode()
 
-        # After mission complete, command AUTO.LAND so the vehicle lands
-        # gracefully rather than hanging in OFFBOARD until the process is killed.
+        # After mission complete, hold the last setpoint to keep OFFBOARD alive
+        # while the AUTO.LAND mode switch takes effect. Without a fresh
+        # trajectory_setpoint, OFFBOARD times out in ~500ms and the
+        # OFFBOARD-loss failsafe (COM_OBL_ACT=0, position hold) wins the race.
         if self._done:
+            self._publish_setpoint(*WAYPOINTS[-1])
             self._send_command(
                 VEHICLE_CMD_DO_SET_MODE,
                 1.0,
