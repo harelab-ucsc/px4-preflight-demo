@@ -154,16 +154,16 @@ class OffboardMissionNode(Node):
         self._publish_setpoint(*wp)
         self.setpoint_count += 1
 
-        # PX4 requires a few cycles of streaming setpoints before it accepts
-        # arm + OFFBOARD mode switch. Arm first, then switch to OFFBOARD once
-        # PX4 confirms armed — reversing this order risks arming in whatever
-        # mode PX4 defaults to (e.g. AUTO.TAKEOFF) before OFFBOARD sticks.
-        if self.setpoint_count == 10:
-            self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
-        if self.setpoint_count >= 10 and self.armed and not self.offboard:
+        # PX4 offboard sequence: switch to OFFBOARD while disarmed (setpoints
+        # must already be streaming), then arm once PX4 confirms OFFBOARD.
+        # Arming first risks PX4 latching into HOLD/LOITER before the mode
+        # switch lands, after which OFFBOARD is rejected.
+        if self.setpoint_count >= 10 and not self.offboard:
             self._send_command(
                 VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
             )
+        elif self.setpoint_count >= 10 and self.offboard and not self.armed:
+            self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
 
         if self.position is not None:
             dx = self.position[0] - wp[0]
