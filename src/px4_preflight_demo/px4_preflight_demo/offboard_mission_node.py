@@ -65,7 +65,7 @@ class OffboardMissionNode(Node):
             VehicleCommand, "/fmu/in/vehicle_command", qos
         )
         self.create_subscription(
-            VehicleStatus, "/fmu/out/vehicle_status", self._on_status, qos
+            VehicleStatus, "/fmu/out/vehicle_status_v1", self._on_status, qos
         )
         self.create_subscription(
             VehicleLocalPosition,
@@ -164,9 +164,14 @@ class OffboardMissionNode(Node):
         elif self._state == "offboard_req":
             if self.offboard:
                 self.get_logger().info("OFFBOARD mode confirmed")
+                self._stable_ticks = 0
                 self._state = "stable_offboard"
             else:
-                # Retry until PX4 accepts the mode switch
+                if self._stable_ticks % 20 == 0:
+                    self.get_logger().info(
+                        f"waiting for OFFBOARD (armed={self.armed} offboard={self.offboard})"
+                    )
+                self._stable_ticks += 1
                 self._send_command(
                     VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
                 )
