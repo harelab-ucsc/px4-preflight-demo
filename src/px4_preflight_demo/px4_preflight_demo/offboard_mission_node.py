@@ -79,6 +79,8 @@ class OffboardMissionNode(Node):
         self.position = None
         self.current_wp = 0
         self.setpoint_count = 0
+        self._done = False
+        self._final_wp = None
         self.results = {
             "waypoints_hit": [False] * len(WAYPOINTS),
             "hit_count": 0,
@@ -136,7 +138,15 @@ class OffboardMissionNode(Node):
         # Setpoints must stream continuously for OFFBOARD to stay engaged.
         self._publish_offboard_mode()
 
+        if self._done:
+            # Keep streaming the final position so OFFBOARD doesn't drop
+            # while run_sim.sh's timeout is still counting down.
+            if self._final_wp is not None:
+                self._publish_setpoint(*self._final_wp)
+            return
+
         if self.current_wp >= len(WAYPOINTS):
+            self._final_wp = WAYPOINTS[-1]
             self._finish(passed=True, reason="all waypoints reached")
             return
 
@@ -145,12 +155,15 @@ class OffboardMissionNode(Node):
         self.setpoint_count += 1
 
         # PX4 requires a few cycles of streaming setpoints before it accepts
-        # the OFFBOARD mode switch + arm command.
+        # arm + OFFBOARD mode switch. Arm first, then switch to OFFBOARD once
+        # PX4 confirms armed — reversing this order risks arming in whatever
+        # mode PX4 defaults to (e.g. AUTO.TAKEOFF) before OFFBOARD sticks.
         if self.setpoint_count == 10:
+            self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+        if self.setpoint_count >= 10 and self.armed and not self.offboard:
             self._send_command(
                 VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
             )
-            self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
 
         if self.position is not None:
             dx = self.position[0] - wp[0]
@@ -165,14 +178,14 @@ class OffboardMissionNode(Node):
                 self.current_wp += 1
 
     def _finish(self, passed, reason):
-        if self.results["pass"] and not passed:
-            return  # already finished
+        if self._done:
+            return
+        self._done = True
         self.results["pass"] = bool(passed)
         self.results["reason"] = reason
         with open(RESULTS_PATH, "w") as f:
             json.dump(self.results, f, indent=2)
         self.get_logger().info(f"results written to {RESULTS_PATH}: {self.results}")
-        rclpy.shutdown()
 
 
 def main():
@@ -183,7 +196,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if not node.results["pass"]:
+        if not node._done:
             node._finish(
                 passed=False,
                 reason=f"only {node.results['hit_count']}/{node.results['total']} "
