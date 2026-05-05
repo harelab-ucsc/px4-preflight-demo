@@ -48,37 +48,47 @@ class OffboardMissionNode(Node):
     def __init__(self):
         super().__init__("offboard_mission")
 
-        qos = QoSProfile(
+        # Publishers use TRANSIENT_LOCAL; subscribers use VOLATILE.
+        # Mixing them causes silent QoS mismatches (ref: Jaeyoung-Lim/px4-offboard).
+        pub_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        sub_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
         self.offboard_pub = self.create_publisher(
-            OffboardControlMode, "/fmu/in/offboard_control_mode", qos
+            OffboardControlMode, "/fmu/in/offboard_control_mode", pub_qos
         )
         self.setpoint_pub = self.create_publisher(
-            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", qos
+            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", pub_qos
         )
         self.cmd_pub = self.create_publisher(
-            VehicleCommand, "/fmu/in/vehicle_command", qos
+            VehicleCommand, "/fmu/in/vehicle_command", pub_qos
         )
-        self.create_subscription(
-            VehicleStatus, "/fmu/out/vehicle_status", self._on_status, qos
-        )
+        # Subscribe to both names: v1.16+ renamed to vehicle_status_v1.
+        for topic in ("/fmu/out/vehicle_status", "/fmu/out/vehicle_status_v1"):
+            self.create_subscription(VehicleStatus, topic, self._on_status, sub_qos)
         self.create_subscription(
             VehicleLocalPosition,
             "/fmu/out/vehicle_local_position",
             self._on_position,
-            qos,
+            sub_qos,
         )
-
         self.armed = False
         self.offboard = False
         self.position = None
         self.current_wp = 0
-        self.setpoint_count = 0
+        self._state = "init"
+        self._stable_ticks = 0
+        self._done = False
+        self.done_future = rclpy.task.Future()
         self.results = {
             "waypoints_hit": [False] * len(WAYPOINTS),
             "hit_count": 0,
@@ -133,57 +143,92 @@ class OffboardMissionNode(Node):
 
     # ── Main loop ────────────────────────────────────────────────────────
     def _control_loop(self):
-        # Setpoints must stream continuously for OFFBOARD to stay engaged.
-        self._publish_offboard_mode()
-
-        if self.current_wp >= len(WAYPOINTS):
-            self._finish(passed=True, reason="all waypoints reached")
+        if self._done:
             return
 
-        wp = WAYPOINTS[self.current_wp]
-        self._publish_setpoint(*wp)
-        self.setpoint_count += 1
+        # Setpoints must stream on every tick — PX4 drops OFFBOARD if they stop.
+        self._publish_offboard_mode()
 
-        # PX4 requires a few cycles of streaming setpoints before it accepts
-        # the OFFBOARD mode switch + arm command.
-        if self.setpoint_count == 10:
+        wp = WAYPOINTS[min(self.current_wp, len(WAYPOINTS) - 1)]
+        self._publish_setpoint(*wp)
+
+        # State machine matching the official PX4 ROS 2 offboard example:
+        # 1. init           — request OFFBOARD mode on first tick
+        # 2. offboard_req   — wait for VehicleStatus to confirm nav_state==OFFBOARD
+        # 3. stable_offboard— stream 10 more ticks so PX4 considers it stable
+        # 4. arm_req        — send ARM, wait for arming_state==ARMED
+        # 5. flying         — execute waypoints
+        if self._state == "init":
             self._send_command(
                 VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
             )
-            self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+            self._state = "offboard_req"
 
-        if self.position is not None:
-            dx = self.position[0] - wp[0]
-            dy = self.position[1] - wp[1]
-            dz = self.position[2] - wp[2]
-            if math.sqrt(dx * dx + dy * dy + dz * dz) < WAYPOINT_RADIUS:
-                self.results["waypoints_hit"][self.current_wp] = True
-                self.results["hit_count"] += 1
-                self.get_logger().info(
-                    f"waypoint {self.current_wp + 1}/{len(WAYPOINTS)} reached"
+        elif self._state == "offboard_req":
+            if self.offboard:
+                self.get_logger().info("OFFBOARD mode confirmed")
+                self._stable_ticks = 0
+                self._state = "stable_offboard"
+            else:
+                if self._stable_ticks % 20 == 0:
+                    self.get_logger().info(
+                        f"waiting for OFFBOARD (armed={self.armed} offboard={self.offboard})"
+                    )
+                self._stable_ticks += 1
+                self._send_command(
+                    VEHICLE_CMD_DO_SET_MODE, 1.0, PX4_CUSTOM_MAIN_MODE_OFFBOARD
                 )
-                self.current_wp += 1
+
+        elif self._state == "stable_offboard":
+            self._stable_ticks += 1
+            if self._stable_ticks >= 10:
+                self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+                self._state = "arm_req"
+
+        elif self._state == "arm_req":
+            if self.armed:
+                self.get_logger().info("Armed in OFFBOARD mode — starting mission")
+                self._state = "flying"
+            else:
+                self._send_command(VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+
+        elif self._state == "flying":
+            if self.current_wp >= len(WAYPOINTS):
+                self._finish(passed=True, reason="all waypoints reached")
+                return
+            if self.position is not None:
+                dx = self.position[0] - wp[0]
+                dy = self.position[1] - wp[1]
+                dz = self.position[2] - wp[2]
+                if math.sqrt(dx * dx + dy * dy + dz * dz) < WAYPOINT_RADIUS:
+                    self.results["waypoints_hit"][self.current_wp] = True
+                    self.results["hit_count"] += 1
+                    self.get_logger().info(
+                        f"waypoint {self.current_wp + 1}/{len(WAYPOINTS)} reached"
+                    )
+                    self.current_wp += 1
 
     def _finish(self, passed, reason):
-        if self.results["pass"] and not passed:
-            return  # already finished
+        if self._done:
+            return
+        self._done = True
         self.results["pass"] = bool(passed)
         self.results["reason"] = reason
         with open(RESULTS_PATH, "w") as f:
             json.dump(self.results, f, indent=2)
         self.get_logger().info(f"results written to {RESULTS_PATH}: {self.results}")
-        rclpy.shutdown()
+        self.done_future.set_result(True)
 
 
 def main():
     rclpy.init()
     node = OffboardMissionNode()
     try:
-        rclpy.spin(node)
+        rclpy.spin_until_future_complete(node, node.done_future)
     except KeyboardInterrupt:
         pass
     finally:
-        if not node.results["pass"]:
+        if not node._done:
             node._finish(
                 passed=False,
                 reason=f"only {node.results['hit_count']}/{node.results['total']} "
